@@ -15,7 +15,6 @@ from io import BytesIO
 import uuid
 from telegram.helpers import escape_markdown
 from dotenv import load_dotenv
-
 load_dotenv()
 
 # ---------------------------
@@ -26,6 +25,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # ---------------------------
 # Load sensitive configuration from environment variables
@@ -104,13 +104,25 @@ def get_inbound_config(inbound_id: str) -> str:
         logger.exception("Error while accessing the API for config retrieval:")
         return None
 
+def get_client_traffic(email: str) -> dict:
+    url = f"{API_HOST}/panel/api/inbounds/getClientTraffics/{email}"
+    try:
+        response = session.get(url, timeout=10)
+        logger.debug("Client traffic response: %s", response.text)
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        else:
+            logger.error("Error retrieving client traffic: %s", response.text)
+            return None
+    except Exception as e:
+        logger.exception("Exception retrieving client traffic:")
+        return None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles the /start command. Sends a welcome message with inline keyboard buttons.
-    """
     welcome_text = (
-        "Welcome to the VPN Config Generator Bot!\n\n"
-        "Choose your platform or generate your configuration below."
+        "Hello! 😃 Welcome to our VPN Bot!\n\n"
+        "Choose a platform to download the client, generate your config, or check your statistics."
     )
     keyboard = [
         [
@@ -118,8 +130,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("iOS 🍎", url="https://apps.apple.com/pl/app/v2raytun/id6476628951")
         ],
         [
-            # Example: using inbound with id = 1. Modify if you implement inbound selection.
-            InlineKeyboardButton("Generate Config 🔧", callback_data="config_1")
+            InlineKeyboardButton("Generate Config 🔧", callback_data="config_1"),
+            InlineKeyboardButton("Statistics 📊", callback_data="stats")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -175,97 +187,142 @@ def create_client(inbound_id: int, email: str) -> dict:
         return None
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles callback queries triggered by inline keyboard buttons.
-    Generates a configuration link for the selected inbound.
-    """
+    logger.debug("button_handler invoked")
     query = update.callback_query
     await query.answer()
-
     data = query.data
-    if not data.startswith("config_"):
-        await query.message.reply_text("Unknown action.")
-        return
+    logger.debug("Callback data: %s", data)
 
-    inbound_id = data.split("_", 1)[1]
-    await query.edit_message_text(text="Processing configuration generation request...")
+    if data.startswith("config_"):
+        inbound_id = data.split("_", 1)[1]
+        logger.debug("Parsed inbound_id: %s", inbound_id)
+        await query.edit_message_text(text=f"Processing request for inbound {inbound_id}...")
 
-    # Retrieve inbound details via API (get_inbound_config should return a JSON string or dict)
-    inbound_details = get_inbound_config(inbound_id)
-    if not inbound_details:
-        await query.message.reply_text("Error retrieving inbound data. Please try again later.")
-        return
-    if isinstance(inbound_details, str):
+        inbound_details = get_inbound_config(inbound_id)
+        logger.debug("Received inbound_details: %s", inbound_details)
+        if not inbound_details:
+            await query.message.reply_text("Error retrieving inbound data. Please try again later.")
+            return
+        if isinstance(inbound_details, str):
+            try:
+                inbound_details = json.loads(inbound_details)
+                logger.debug("Parsed inbound_details JSON: %s", inbound_details)
+            except Exception as e:
+                logger.error("Error parsing inbound data: %s", e)
+                await query.message.reply_text("Error parsing inbound data.")
+                return
+
+        if "obj" in inbound_details:
+            inbound_details = inbound_details["obj"]
+            logger.debug("Using inbound_details from 'obj': %s", inbound_details)
+
+        port = inbound_details.get("port", 0)
+        if not port or port == 0:
+            logger.error("Inbound port is 0")
+            await query.message.reply_text("Error: Inbound port is 0")
+            return
+        logger.debug("Inbound port: %s", port)
+
+        remark = inbound_details.get("remark")
+        if not remark:
+            remark = "vless-ws-tls"
+        logger.debug("Remark: %s", remark)
+
         try:
-            inbound_details = json.loads(inbound_details)
-        except Exception:
-            await query.message.reply_text("Error parsing inbound data.")
-            return
+            stream_settings = json.loads(inbound_details.get("streamSettings", "{}"))
+            logger.debug("Stream settings: %s", stream_settings)
+        except Exception as e:
+            logger.error("Error parsing streamSettings: %s", e)
+            stream_settings = {}
 
-    # If the API returns an object under "obj", use it
-    if "obj" in inbound_details:
-        inbound_details = inbound_details["obj"]
+        ws_settings = stream_settings.get("wsSettings", {})
+        ws_path = ws_settings.get("path", "/ws")
+        ws_host = ws_settings.get("host", "vpn.jfett.cloud")
+        security = stream_settings.get("security", "tls")
+        alpn_list = stream_settings.get("alpn", [])
+        alpn_str = ",".join(alpn_list) if isinstance(alpn_list, list) else alpn_list
+        tls_settings = stream_settings.get("tlsSettings", {})
+        sni = tls_settings.get("serverName", ws_host)
 
-    # Extract the port; if it is 0, return an error
-    port = inbound_details.get("port", 0)
-    if not port or port == 0:
-        await query.message.reply_text("Error: inbound port is 0")
-        return
-
-    # Use the 'remark' field for the link fragment (if empty, set a default value)
-    remark = inbound_details.get("remark")
-    if not remark:
-        remark = "vless-ws-tls"
-
-    # Retrieve streamSettings (stored as a JSON string)
-    try:
-        stream_settings = json.loads(inbound_details.get("streamSettings", "{}"))
-    except Exception:
-        stream_settings = {}
-    ws_settings = stream_settings.get("wsSettings", {})
-    ws_path = ws_settings.get("path", "/ws")
-    ws_host = ws_settings.get("host", "vpn.example.com")
-    security = stream_settings.get("security", "tls")
-    alpn_list = stream_settings.get("alpn", [])
-    alpn_str = ",".join(alpn_list) if isinstance(alpn_list, list) else alpn_list
-    tls_settings = stream_settings.get("tlsSettings", {})
-    sni = tls_settings.get("serverName", ws_host)
-
-    # Retrieve client data from context.user_data; if absent, create a new client via the API
-    user = update.effective_user
-    client_id = context.user_data.get("client_id")
-    client_email = context.user_data.get("client_email")
-    if not client_id or not client_email:
+        user = update.effective_user
         client_email = user.username if user.username else f"user{user.id}"
-        new_client = create_client(int(inbound_id), client_email)
-        if not new_client:
-            await query.message.reply_text("Error creating a new client. Please try again later.")
+        logger.debug("User email to check: %s", client_email)
+
+        try:
+            settings = json.loads(inbound_details.get("settings", "{}"))
+            logger.debug("Inbound settings: %s", settings)
+        except Exception as e:
+            logger.error("Error parsing inbound settings: %s", e)
+            settings = {}
+        clients = settings.get("clients", [])
+        existing_client = None
+        for c in clients:
+            if c.get("email") == client_email:
+                existing_client = c
+                break
+
+        if existing_client:
+            await query.message.reply_text("You already have a config in the 3x‑ui system!")
+            client_id = existing_client.get("id")
+            logger.debug("Existing client found: %s", existing_client)
+            context.user_data["client_id"] = client_id
+            context.user_data["client_email"] = client_email
+        else:
+            new_client = create_client(int(inbound_id), client_email)
+            if not new_client:
+                logger.error("Error creating new client")
+                await query.message.reply_text("Error creating new client. Please try again later.")
+                return
+            client_id = new_client["client_id"]
+            client_email = new_client["email"]
+            logger.debug("New client created: %s", new_client)
+            context.user_data["client_id"] = client_id
+            context.user_data["client_email"] = client_email
+
+        fragment = f"{remark}-{client_email}"
+        encoded_path = urllib.parse.quote(ws_path)
+        link = (f"vless://{client_id}@{ws_host}:{port}"
+                f"?type=ws&path={encoded_path}&host={ws_host}&security={security}"
+                f"&fp=chrome&alpn={alpn_str}&sni={sni}#{fragment}")
+        logger.debug("Generated link: %s", link)
+
+        context.user_data["last_config"] = link
+
+        qr_img = qrcode.make(link)
+        bio = BytesIO()
+        qr_img.save(bio, format="PNG")
+        bio.seek(0)
+
+        config_message = f"Your config:\n```\n{escape_markdown(link, version=2)}\n```"
+        await query.message.reply_text(config_message, parse_mode="MarkdownV2")
+        await query.message.reply_photo(photo=bio)
+
+    elif data == "stats":
+        user = update.effective_user
+        user_id = user.id
+        logger.debug("Retrieving stats for user id: %s", user_id)
+        # Use the username (or fallback) as the client identifier for traffic
+        client_email = user.username if user.username else f"user{user.id}"
+        stats_data = get_client_traffic(client_email)
+        if not stats_data or not stats_data.get("success"):
+            await query.message.reply_text("Error retrieving statistics. Please try again later.")
             return
-        client_id = new_client["client_id"]
-        client_email = new_client["email"]
-        context.user_data["client_id"] = client_id
-        context.user_data["client_email"] = client_email
-
-    # Form the fragment and the final vless connection link
-    fragment = f"{remark}-{client_email}"
-    encoded_path = urllib.parse.quote(ws_path)
-    link = (f"vless://{client_id}@{ws_host}:{port}"
-            f"?type=ws&path={encoded_path}&host={ws_host}&security={security}"
-            f"&fp=chrome&alpn={alpn_str}&sni={sni}#{fragment}")
-
-    # Save the generated config for potential future use
-    context.user_data["last_config"] = link
-
-    # Generate a QR code for the connection link
-    qr_img = qrcode.make(link)
-    bio = BytesIO()
-    qr_img.save(bio, format="PNG")
-    bio.seek(0)
-
-    # Send the configuration wrapped in a Markdown code block for easy copying
-    config_message = f"Your configuration:\n```\n{escape_markdown(link, version=2)}\n```"
-    await query.message.reply_text(config_message, parse_mode="MarkdownV2")
-    await query.message.reply_photo(photo=bio)
+        stats_obj = stats_data.get("obj")
+        if not stats_obj:
+            await query.message.reply_text("No statistics available.")
+            return
+        # Only keep the up and down fields; use user id instead of email
+        up = stats_obj.get("up", 0)
+        down = stats_obj.get("down", 0)
+        stats_message = (
+            "📊 *Traffic Statistics*\n\n"
+            f"👤 *User ID:* `{user_id}`\n"
+            f"📤 *Uploaded:* `{up}` bytes\n"
+            f"📥 *Downloaded:* `{down}` bytes\n"
+        )
+        await query.message.reply_text(stats_message, parse_mode="Markdown")
+    else:
+        await query.message.reply_text("Unknown action.")
 
 def main() -> None:
     """

@@ -104,6 +104,13 @@ def get_inbound_config(inbound_id: str) -> str:
         logger.exception("Error while accessing the API for config retrieval:")
         return None
 
+def format_traffic(traffic_bytes: int) -> str:
+    """Format traffic in MB if less than 1 GB, otherwise in GB."""
+    if traffic_bytes < 1073741824:
+        return f"{traffic_bytes / 1048576:.2f} MB"
+    else:
+        return f"{traffic_bytes / 1073741824:.2f} GB"
+
 def get_client_traffic(email: str) -> dict:
     url = f"{API_HOST}/panel/api/inbounds/getClientTraffics/{email}"
     try:
@@ -122,7 +129,7 @@ def get_client_traffic(email: str) -> dict:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_text = (
         "Hello! 😃 Welcome to our VPN Bot!\n\n"
-        "Choose a platform to download the client, generate your config, or check your statistics."
+        "Choose a platform to download the client, generate your config, check your statistics, or view FAQ."
     )
     keyboard = [
         [
@@ -132,6 +139,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [
             InlineKeyboardButton("Generate Config 🔧", callback_data="config_1"),
             InlineKeyboardButton("Statistics 📊", callback_data="stats")
+        ],
+        [
+            InlineKeyboardButton("FAQ ❓", callback_data="faq")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -301,7 +311,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user = update.effective_user
         user_id = user.id
         logger.debug("Retrieving stats for user id: %s", user_id)
-        # Use the username (or fallback) as the client identifier for traffic
         client_email = user.username if user.username else f"user{user.id}"
         stats_data = get_client_traffic(client_email)
         if not stats_data or not stats_data.get("success"):
@@ -311,16 +320,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not stats_obj:
             await query.message.reply_text("No statistics available.")
             return
-        # Only keep the up and down fields; use user id instead of email
         up = stats_obj.get("up", 0)
         down = stats_obj.get("down", 0)
+        up_str = format_traffic(up)
+        down_str = format_traffic(down)
         stats_message = (
             "📊 *Traffic Statistics*\n\n"
             f"👤 *User ID:* `{user_id}`\n"
-            f"📤 *Uploaded:* `{up}` bytes\n"
-            f"📥 *Downloaded:* `{down}` bytes\n"
+            f"📤 *Uploaded:* `{up_str}`\n"
+            f"📥 *Downloaded:* `{down_str}`\n"
         )
         await query.message.reply_text(stats_message, parse_mode="Markdown")
+        
+    elif data == "faq":
+        faq_message = (
+            "❓ *FAQ: How to Load Your Config*\n\n"
+            "1. *Copy the Config*: Tap the config message to copy the VLESS link shown in the code block.\n"
+            "2. *Open Your Client*: Launch your VLESS-compatible client (e.g., v2rayNG).\n"
+            "3. *Import Config*: Look for an option like 'Import Config' or 'Scan QR Code'.\n"
+            "   - You can paste the copied config string, or scan the QR code provided.\n"
+            "4. *Connect*: Save the configuration and connect to start using your VPN.\n\n"
+            "If you have any questions, feel free to ask!"
+        )
+        await query.message.reply_text(faq_message, parse_mode="Markdown")
     else:
         await query.message.reply_text("Unknown action.")
 

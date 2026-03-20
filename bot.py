@@ -322,14 +322,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             logger.error("Error parsing streamSettings: %s", e)
             stream_settings = {}
 
-        ws_settings = stream_settings.get("wsSettings", {})
-        ws_path = ws_settings.get("path", "/ws")
-        ws_host = ws_settings.get("host", "vpn.jfett.cloud")
-        security = stream_settings.get("security", "tls")
-        alpn_list = stream_settings.get("alpn", [])
-        alpn_str = ",".join(alpn_list) if isinstance(alpn_list, list) else alpn_list
-        tls_settings = stream_settings.get("tlsSettings", {})
-        sni = tls_settings.get("serverName", ws_host)
+        network = stream_settings.get("network", "tcp")
+        security = stream_settings.get("security", "reality")
+        reality_settings = stream_settings.get("realitySettings", {})
+        reality_sub_settings = reality_settings.get("settings", {})
+        pbk = reality_sub_settings.get("publicKey", "")
+        fp = reality_sub_settings.get("fingerprint", "chrome")
+        spx = reality_sub_settings.get("spiderX", "")
+        server_names = reality_settings.get("serverNames", [])
+        sni = server_names[0] if server_names else ""
+        short_ids = reality_settings.get("shortIds", [])
+        sid = short_ids[0] if short_ids else ""
 
         user = update.effective_user
         client_email = user.username if user.username else f"user{user.id}"
@@ -385,11 +388,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context.user_data["client_email"] = client_email
 
         fragment = f"{remark}-{client_email}"
-        encoded_path = urllib.parse.quote(ws_path)
+        server_host = urllib.parse.urlparse(API_HOST).hostname
+        encoded_spx = urllib.parse.quote(spx) if spx else ""
         link = (
-            f"vless://{client_id}@{ws_host}:{port}"
-            f"?type=ws&path={encoded_path}&host={ws_host}&security={security}"
-            f"&fp=chrome&alpn={alpn_str}&sni={sni}#{fragment}"
+            f"vless://{client_id}@{server_host}:{port}"
+            f"?type={network}&security={security}"
+            f"&pbk={pbk}&fp={fp}&sni={sni}&sid={sid}"
+            f"&spx={encoded_spx}#{fragment}"
         )
         logger.debug("Generated link: %s", link)
 

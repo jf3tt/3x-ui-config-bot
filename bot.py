@@ -35,6 +35,7 @@ API_HOST = os.getenv("API_HOST")
 API_USERNAME = os.getenv("API_USERNAME")
 API_PASSWORD = os.getenv("API_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # Optional: channel for registration notifications
 
 if not all([API_HOST, API_USERNAME, API_PASSWORD, TELEGRAM_TOKEN]):
     logger.error("Missing one or more required environment variables: "
@@ -252,6 +253,24 @@ def format_traffic(traffic_bytes: int) -> str:
     else:
         return f"{traffic_bytes / 1073741824:.2f} GB"
 
+async def notify_channel(bot, user, inbound_remark: str, inbound_id) -> None:
+    """Send a registration notification to the private channel (if configured)."""
+    if not CHANNEL_ID:
+        return
+    username_str = f"@{user.username}" if user.username else "N/A"
+    full_name = user.full_name or "Unknown"
+    text = (
+        "🆕 New registration\n\n"
+        f"👤 User: {full_name} ({username_str})\n"
+        f"🆔 ID: {user.id}\n"
+        f"🖥 Server: {inbound_remark} (inbound {inbound_id})"
+    )
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=text)
+    except Exception as e:
+        logger.error("Failed to send channel notification: %s", e)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_text = (
         "Hello! 😃 Welcome to our VPN Bot!\n\n"
@@ -384,6 +403,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             client_id = new_client["client_id"]
             client_email = new_client["email"]
             logger.debug("New client created: %s", new_client)
+            await notify_channel(context.bot, user, remark, inbound_id)
             context.user_data["client_id"] = client_id
             context.user_data["client_email"] = client_email
 

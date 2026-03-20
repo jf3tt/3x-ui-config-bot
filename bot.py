@@ -219,7 +219,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("iOS 🍎", url="https://apps.apple.com/pl/app/v2raytun/id6476628951")
         ],
         [
-            InlineKeyboardButton("Generate Config 🔧", callback_data="config_1"),
+            InlineKeyboardButton("Generate Config 🔧", callback_data="config_2"),
             InlineKeyboardButton("Statistics 📊", callback_data="stats")
         ],
         [

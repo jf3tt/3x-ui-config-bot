@@ -182,6 +182,50 @@ def create_client(inbound_id: int, email: str) -> dict:
         logger.error(f"Error creating client: {resp.status_code} - {resp.text}")
         return None
 
+def find_client_across_inbounds(email: str) -> dict:
+    """
+    Searches for a client by email across all inbounds.
+    Returns a dict with 'inbound_id' and 'client' data if found, otherwise None.
+    """
+    inbounds = get_inbounds_list()
+    for inbound in inbounds:
+        try:
+            settings = json.loads(inbound.get("settings", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        clients = settings.get("clients", [])
+        for c in clients:
+            if c.get("email") == email:
+                logger.info("Found client '%s' in inbound %s", email, inbound.get("id"))
+                return {"inbound_id": inbound.get("id"), "client": c}
+    return None
+
+
+def delete_client(inbound_id: int, client_uuid: str) -> bool:
+    """
+    Deletes a client from the specified inbound via POST /panel/api/inbounds/:id/delClient/:clientId.
+    Returns True on success, False on error.
+    """
+    path = f"/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
+    logger.info("Deleting client %s from inbound %s", client_uuid, inbound_id)
+    resp = request_3x_ui("POST", path)
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+            if data.get("success"):
+                logger.info("Successfully deleted client %s from inbound %s", client_uuid, inbound_id)
+                return True
+            else:
+                logger.error("Delete client error: %s", data.get("msg", "No message"))
+                return False
+        except json.JSONDecodeError:
+            logger.error("Non-JSON response when deleting client: %s", resp.text)
+            return False
+    else:
+        logger.error("Error deleting client: %s - %s", resp.status_code, resp.text)
+        return False
+
+
 def get_client_traffic(email: str) -> dict:
     """
     Retrieves client traffic data via GET /panel/api/inbounds/getClientTraffics/{email}.
@@ -291,29 +335,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         client_email = user.username if user.username else f"user{user.id}"
         logger.debug("User email to check: %s", client_email)
 
-        try:
-            settings = json.loads(inbound_details.get("settings", "{}"))
-            logger.debug("Inbound settings: %s", settings)
-        except Exception as e:
-            logger.error("Error parsing inbound settings: %s", e)
-            settings = {}
-        clients = settings.get("clients", [])
-        existing_client = None
-        for c in clients:
-            if c.get("email") == client_email:
-                existing_client = c
-                break
+        # Search for existing client across ALL inbounds
+        found = find_client_across_inbounds(client_email)
 
-        if existing_client:
-            await query.message.reply_text("You already have a config in the 3x‑ui system!")
-            client_id = existing_client.get("id")
-            logger.debug("Existing client found: %s", existing_client)
-            context.user_data["client_id"] = client_id
-            context.user_data["client_email"] = client_email
+        if found:
+            found_inbound_id = found["inbound_id"]
+            found_client = found["client"]
+            logger.debug("Client '%s' found in inbound %s: %s", client_email, found_inbound_id, found_client)
+
+            if found_inbound_id == int(inbound_id):
+                # Client already exists in the target inbound — just return existing config
+                await query.message.reply_text("You already have a config! Here it is:")
+                client_id = found_client.get("id")
+                context.user_data["client_id"] = client_id
+                context.user_data["client_email"] = client_email
+            else:
+                # Client exists in a different inbound — migrate to the target one
+                logger.info("Migrating client '%s' from inbound %s to inbound %s",
+                            client_email, found_inbound_id, inbound_id)
+                old_client_uuid = found_client.get("id")
+                deleted = delete_client(found_inbound_id, old_client_uuid)
+                if not deleted:
+                    logger.error("Failed to delete client '%s' from inbound %s", client_email, found_inbound_id)
+                    await query.message.reply_text("Error migrating your config. Please try again later.")
+                    return
+
+                new_client = create_client(int(inbound_id), client_email)
+                if not new_client:
+                    logger.error("Error creating client '%s' in inbound %s after migration", client_email, inbound_id)
+                    await query.message.reply_text("Error creating new config after migration. Please try again later.")
+                    return
+                client_id = new_client["client_id"]
+                client_email = new_client["email"]
+                logger.info("Client '%s' migrated successfully to inbound %s", client_email, inbound_id)
+                await query.message.reply_text("Your config has been migrated to the new server. Here is your new config:")
+                context.user_data["client_id"] = client_id
+                context.user_data["client_email"] = client_email
         else:
+            # Client does not exist anywhere — create a new one
             new_client = create_client(int(inbound_id), client_email)
             if not new_client:
-                logger.error("Error creating new client")
+                logger.error("Error creating new client '%s'", client_email)
                 await query.message.reply_text("Error creating new client. Please try again later.")
                 return
             client_id = new_client["client_id"]

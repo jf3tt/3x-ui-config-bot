@@ -183,6 +183,28 @@ def create_client(inbound_id: int, email: str) -> dict:
         logger.error(f"Error creating client: {resp.status_code} - {resp.text}")
         return None
 
+def find_client_in_inbound(inbound_id: int, email: str) -> dict:
+    """
+    Searches for a client by email in a specific inbound.
+    Returns the client dict if found, otherwise None.
+    """
+    config = get_inbound_config(str(inbound_id))
+    if not config:
+        return None
+    try:
+        data = json.loads(config) if isinstance(config, str) else config
+        if "obj" in data:
+            data = data["obj"]
+        settings = json.loads(data.get("settings", "{}"))
+        for c in settings.get("clients", []):
+            if c.get("email") == email:
+                logger.info("Found client '%s' in inbound %s", email, inbound_id)
+                return c
+    except (json.JSONDecodeError, TypeError, KeyError):
+        pass
+    return None
+
+
 def find_client_across_inbounds(email: str) -> dict:
     """
     Searches for a client by email across all inbounds.
@@ -282,7 +304,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("iOS 🍎", url="https://apps.apple.com/pl/app/v2raytun/id6476628951")
         ],
         [
-            InlineKeyboardButton("Generate Config 🔧", callback_data="config_2"),
+            InlineKeyboardButton("Generate Config 🔧", callback_data="choose_protocol"),
             InlineKeyboardButton("Statistics 📊", callback_data="stats")
         ],
         [
@@ -298,6 +320,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     data = query.data
     logger.debug("Callback data: %s", data)
+
+    if data == "choose_protocol":
+        keyboard = [
+            [
+                InlineKeyboardButton("Reality (TCP) 🌐", callback_data="config_2"),
+                InlineKeyboardButton("Reality (XHTTP) ⚡", callback_data="config_3"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            text="Choose a protocol:\n\n"
+                 "• *Reality \\(TCP\\)* — standard, proven protocol\n"
+                 "• *Reality \\(XHTTP\\)* — newer protocol, better anti\\-censorship",
+            reply_markup=reply_markup,
+            parse_mode="MarkdownV2"
+        )
+        return
 
     if data.startswith("config_"):
         inbound_id = data.split("_", 1)[1]
@@ -353,57 +392,50 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         short_ids = reality_settings.get("shortIds", [])
         sid = short_ids[0] if short_ids else ""
 
+        # Parse XHTTP path if applicable
+        xhttp_settings = stream_settings.get("xhttpSettings", {})
+        xhttp_path = xhttp_settings.get("path", "")
+
         user = update.effective_user
-        client_email = user.username if user.username else f"user{user.id}"
-        logger.debug("User email to check: %s", client_email)
+        base_email = user.username if user.username else f"user{user.id}"
+        client_email = f"{base_email}-xhttp" if int(inbound_id) == 3 else base_email
+        logger.debug("User email to check: %s (base: %s)", client_email, base_email)
 
-        # Search for existing client across ALL inbounds
-        found = find_client_across_inbounds(client_email)
+        # 1. Check if client already exists in the TARGET inbound
+        existing = find_client_in_inbound(int(inbound_id), client_email)
 
-        if found:
-            found_inbound_id = found["inbound_id"]
-            found_client = found["client"]
-            logger.debug("Client '%s' found in inbound %s: %s", client_email, found_inbound_id, found_client)
-
-            if found_inbound_id == int(inbound_id):
-                # Client already exists in the target inbound — just return existing config
-                await query.message.reply_text("You already have a config! Here it is:")
-                client_id = found_client.get("id")
-                context.user_data["client_id"] = client_id
-                context.user_data["client_email"] = client_email
-            else:
-                # Client exists in a different inbound — migrate to the target one
-                logger.info("Migrating client '%s' from inbound %s to inbound %s",
-                            client_email, found_inbound_id, inbound_id)
-                old_client_uuid = found_client.get("id")
-                deleted = delete_client(found_inbound_id, old_client_uuid)
+        if existing:
+            # Client already has a config on this inbound — return it
+            logger.debug("Client '%s' already exists in inbound %s", client_email, inbound_id)
+            await query.message.reply_text("You already have a config! Here it is:")
+            client_id = existing.get("id")
+            context.user_data["client_id"] = client_id
+            context.user_data["client_email"] = client_email
+        else:
+            # 2. Check if client exists in the OLD inbound #1 (WS+TLS) for migration
+            old_client = find_client_in_inbound(1, base_email)
+            if old_client:
+                logger.info("Migrating client '%s' from old inbound 1 to inbound %s", base_email, inbound_id)
+                deleted = delete_client(1, old_client.get("id"))
                 if not deleted:
-                    logger.error("Failed to delete client '%s' from inbound %s", client_email, found_inbound_id)
+                    logger.error("Failed to delete client '%s' from old inbound 1", base_email)
                     await query.message.reply_text("Error migrating your config. Please try again later.")
                     return
 
-                new_client = create_client(int(inbound_id), client_email)
-                if not new_client:
-                    logger.error("Error creating client '%s' in inbound %s after migration", client_email, inbound_id)
-                    await query.message.reply_text("Error creating new config after migration. Please try again later.")
-                    return
-                client_id = new_client["client_id"]
-                client_email = new_client["email"]
-                logger.info("Client '%s' migrated successfully to inbound %s", client_email, inbound_id)
-                await query.message.reply_text("Your config has been migrated to the new server. Here is your new config:")
-                context.user_data["client_id"] = client_id
-                context.user_data["client_email"] = client_email
-        else:
-            # Client does not exist anywhere — create a new one
+            # 3. Create new client in the target inbound
             new_client = create_client(int(inbound_id), client_email)
             if not new_client:
-                logger.error("Error creating new client '%s'", client_email)
+                logger.error("Error creating client '%s' in inbound %s", client_email, inbound_id)
                 await query.message.reply_text("Error creating new client. Please try again later.")
                 return
             client_id = new_client["client_id"]
             client_email = new_client["email"]
-            logger.debug("New client created: %s", new_client)
-            await notify_channel(context.bot, user, remark, inbound_id)
+            if old_client:
+                logger.info("Client '%s' migrated from inbound 1 to inbound %s", client_email, inbound_id)
+                await query.message.reply_text("Your config has been migrated from the old server. Here is your new config:")
+            else:
+                logger.debug("New client created: %s", new_client)
+                await notify_channel(context.bot, user, remark, inbound_id)
             context.user_data["client_id"] = client_id
             context.user_data["client_email"] = client_email
 
@@ -414,8 +446,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"vless://{client_id}@{server_host}:{port}"
             f"?type={network}&security={security}"
             f"&pbk={pbk}&fp={fp}&sni={sni}&sid={sid}"
-            f"&spx={encoded_spx}#{fragment}"
+            f"&spx={encoded_spx}"
         )
+        if network == "xhttp" and xhttp_path:
+            encoded_path = urllib.parse.quote(xhttp_path)
+            link += f"&path={encoded_path}"
+        link += f"#{fragment}"
         logger.debug("Generated link: %s", link)
 
         context.user_data["last_config"] = link
@@ -433,32 +469,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user = update.effective_user
         user_id = user.id
         logger.debug("Retrieving stats for user id: %s", user_id)
-        client_email = user.username if user.username else f"user{user.id}"
-        stats_data = get_client_traffic(client_email)
-        if not stats_data or not stats_data.get("success"):
-            await query.message.reply_text("Error retrieving statistics. Please try again later.")
+        base_email = user.username if user.username else f"user{user.id}"
+
+        # Collect stats for both protocols (TCP = base_email, XHTTP = base_email-xhttp)
+        emails_to_check = [
+            ("Reality (TCP)", base_email),
+            ("Reality (XHTTP)", f"{base_email}-xhttp"),
+        ]
+        stats_lines = []
+        has_any_stats = False
+        for label, email in emails_to_check:
+            stats_data = get_client_traffic(email)
+            if stats_data and stats_data.get("success") and stats_data.get("obj"):
+                stats_obj = stats_data["obj"]
+                up = stats_obj.get("up", 0)
+                down = stats_obj.get("down", 0)
+                up_str = format_traffic(up)
+                down_str = format_traffic(down)
+                stats_lines.append(
+                    f"*{label}:*\n"
+                    f"  📤 Uploaded: `{up_str}`\n"
+                    f"  📥 Downloaded: `{down_str}`"
+                )
+                has_any_stats = True
+
+        if not has_any_stats:
+            await query.message.reply_text("No statistics available. Generate a config first!")
             return
-        stats_obj = stats_data.get("obj")
-        if not stats_obj:
-            await query.message.reply_text("No statistics available.")
-            return
-        up = stats_obj.get("up", 0)
-        down = stats_obj.get("down", 0)
-        up_str = format_traffic(up)
-        down_str = format_traffic(down)
+
         stats_message = (
             "📊 *Traffic Statistics*\n\n"
-            f"👤 *User ID:* `{user_id}`\n"
-            f"📤 *Uploaded:* `{up_str}`\n"
-            f"📥 *Downloaded:* `{down_str}`\n"
+            f"👤 *User ID:* `{user_id}`\n\n"
+            + "\n\n".join(stats_lines) + "\n"
         )
         await query.message.reply_text(stats_message, parse_mode="Markdown")
 
     elif data == "faq":
         faq_message = (
             "❓ *FAQ: How to Load Your Config*\n\n"
+            "*Two protocols available:*\n"
+            "• *Reality (TCP)* — standard, proven protocol. Works everywhere.\n"
+            "• *Reality (XHTTP)* — newer protocol with better anti-censorship properties. "
+            "Try this if TCP is blocked in your region.\n"
+            "You can have configs on *both* protocols at the same time.\n\n"
             "1. *Copy the Config*: Tap the config message to copy the VLESS link shown in the code block.\n"
-            "2. *Open Your Client*: Launch your VLESS-compatible client (e.g., v2rayNG).\n"
+            "2. *Open Your Client*: Launch your VLESS-compatible client (e.g., v2rayNG 1.9+, Hiddify, Streisand).\n"
             "3. *Import Config*: Look for an option like 'Import Config' or 'Scan QR Code'.\n"
             "   - You can paste the copied config string, or scan the QR code provided.\n"
             "4. *Connect*: Save the configuration and connect to start using your VPN.\n\n"

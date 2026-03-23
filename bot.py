@@ -98,28 +98,6 @@ def request_3x_ui(method: str, path: str, **kwargs) -> requests.Response:
             logger.error("Re-login failed. Returning original response.")
     return resp
 
-def get_inbounds_list() -> list:
-    """
-    Retrieves a list of inbounds via the API.
-    """
-    resp = request_3x_ui("GET", "/panel/api/inbounds/list")
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-            if data.get("success") and "obj" in data:
-                inbounds = data["obj"]
-                logger.info(f"Retrieved {len(inbounds)} inbounds")
-                return inbounds
-            else:
-                logger.error(f"API error: {data.get('msg', 'No message provided')}")
-                return []
-        except json.JSONDecodeError:
-            logger.error("Received non-JSON response: %s", resp.text)
-            return []
-    else:
-        logger.error(f"Error retrieving inbound list: {resp.status_code} - {resp.text}")
-        return []
-
 def get_inbound_config(inbound_id: str) -> str:
     """
     Retrieves the configuration for the specified inbound by its ID via GET /panel/api/inbounds/get/:id.
@@ -205,50 +183,6 @@ def find_client_in_inbound(inbound_id: int, email: str) -> dict:
     return None
 
 
-def find_client_across_inbounds(email: str) -> dict:
-    """
-    Searches for a client by email across all inbounds.
-    Returns a dict with 'inbound_id' and 'client' data if found, otherwise None.
-    """
-    inbounds = get_inbounds_list()
-    for inbound in inbounds:
-        try:
-            settings = json.loads(inbound.get("settings", "{}"))
-        except (json.JSONDecodeError, TypeError):
-            continue
-        clients = settings.get("clients", [])
-        for c in clients:
-            if c.get("email") == email:
-                logger.info("Found client '%s' in inbound %s", email, inbound.get("id"))
-                return {"inbound_id": inbound.get("id"), "client": c}
-    return None
-
-
-def delete_client(inbound_id: int, client_uuid: str) -> bool:
-    """
-    Deletes a client from the specified inbound via POST /panel/api/inbounds/:id/delClient/:clientId.
-    Returns True on success, False on error.
-    """
-    path = f"/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}"
-    logger.info("Deleting client %s from inbound %s", client_uuid, inbound_id)
-    resp = request_3x_ui("POST", path)
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-            if data.get("success"):
-                logger.info("Successfully deleted client %s from inbound %s", client_uuid, inbound_id)
-                return True
-            else:
-                logger.error("Delete client error: %s", data.get("msg", "No message"))
-                return False
-        except json.JSONDecodeError:
-            logger.error("Non-JSON response when deleting client: %s", resp.text)
-            return False
-    else:
-        logger.error("Error deleting client: %s - %s", resp.status_code, resp.text)
-        return False
-
-
 def get_client_traffic(email: str) -> dict:
     """
     Retrieves client traffic data via GET /panel/api/inbounds/getClientTraffics/{email}.
@@ -324,8 +258,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if data == "choose_protocol":
         keyboard = [
             [
-                InlineKeyboardButton("Reality (TCP) 🌐", callback_data="config_2"),
-                InlineKeyboardButton("Reality (XHTTP) ⚡", callback_data="config_3"),
+                InlineKeyboardButton("Reality (TCP) 🌐", callback_data="config_1"),
+                InlineKeyboardButton("Reality (XHTTP) ⚡", callback_data="config_2"),
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -398,7 +332,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         user = update.effective_user
         base_email = user.username if user.username else f"user{user.id}"
-        client_email = f"{base_email}-xhttp" if int(inbound_id) == 3 else base_email
+        client_email = f"{base_email}-xhttp" if int(inbound_id) == 2 else base_email
         logger.debug("User email to check: %s (base: %s)", client_email, base_email)
 
         # 1. Check if client already exists in the TARGET inbound
@@ -412,17 +346,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context.user_data["client_id"] = client_id
             context.user_data["client_email"] = client_email
         else:
-            # 2. Check if client exists in the OLD inbound #1 (WS+TLS) for migration
-            old_client = find_client_in_inbound(1, base_email)
-            if old_client:
-                logger.info("Migrating client '%s' from old inbound 1 to inbound %s", base_email, inbound_id)
-                deleted = delete_client(1, old_client.get("id"))
-                if not deleted:
-                    logger.error("Failed to delete client '%s' from old inbound 1", base_email)
-                    await query.message.reply_text("Error migrating your config. Please try again later.")
-                    return
-
-            # 3. Create new client in the target inbound
+            # Client does not exist in the target inbound — create a new one
             new_client = create_client(int(inbound_id), client_email)
             if not new_client:
                 logger.error("Error creating client '%s' in inbound %s", client_email, inbound_id)
@@ -430,12 +354,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
             client_id = new_client["client_id"]
             client_email = new_client["email"]
-            if old_client:
-                logger.info("Client '%s' migrated from inbound 1 to inbound %s", client_email, inbound_id)
-                await query.message.reply_text("Your config has been migrated from the old server. Here is your new config:")
-            else:
-                logger.debug("New client created: %s", new_client)
-                await notify_channel(context.bot, user, remark, inbound_id)
+            logger.debug("New client created: %s", new_client)
+            await notify_channel(context.bot, user, remark, inbound_id)
             context.user_data["client_id"] = client_id
             context.user_data["client_email"] = client_email
 

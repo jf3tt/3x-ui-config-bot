@@ -320,6 +320,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             inbound_details = inbound_details["obj"]
             logger.debug("Using inbound_details from 'obj': %s", inbound_details)
 
+        if not isinstance(inbound_details, dict):
+            logger.error(
+                "Inbound %s data is missing or malformed (obj=%r)",
+                inbound_id, inbound_details,
+            )
+            await query.message.reply_text(
+                "Error retrieving inbound data. Please try again later."
+            )
+            return
+
         port = inbound_details.get("port", 0)
         if not port or port == 0:
             logger.error("Inbound port is 0")

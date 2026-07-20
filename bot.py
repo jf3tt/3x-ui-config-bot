@@ -78,20 +78,45 @@ def api_login() -> bool:
         logger.exception("Error during API authentication request:")
         return False
 
+def _session_expired(resp: requests.Response) -> bool:
+    """
+    Detects whether a response indicates an expired/unauthenticated session.
+
+    3x-ui does not always return the HTML login page for API calls: when the
+    session cookie is missing or expired, protected API endpoints respond with
+    an empty-body 404 (or a redirect / 401 / 403) instead of valid JSON. Those
+    cases must also trigger a re-login.
+    """
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/html" in content_type or "<html" in resp.text.lower():
+        return True
+    # Redirect to the login page.
+    if resp.is_redirect or resp.status_code in (401, 403):
+        return True
+    # Unauthenticated API access returns a 404 with a non-JSON (usually empty) body.
+    if resp.status_code == 404:
+        try:
+            resp.json()
+        except ValueError:
+            return True
+    return False
+
+
 def request_3x_ui(method: str, path: str, **kwargs) -> requests.Response:
     """
     A unified request wrapper that:
       1. Sends the request with the current session.
-      2. If the response is HTML (login page), tries to re-login and retries once.
+      2. If the session looks expired, tries to re-login and retries once.
     """
     url = f"{API_HOST}{path}"
     logger.debug("Sending %s request to %s", method, url)
     resp = session.request(method, url, timeout=10, **kwargs)
 
-    content_type = resp.headers.get("Content-Type", "")
-    # If we detect HTML or <html in the response, the session might have expired.
-    if "text/html" in content_type or "<html" in resp.text.lower():
-        logger.warning("Session may have expired (received HTML). Attempting re-login.")
+    if _session_expired(resp):
+        logger.warning(
+            "Session may have expired (status %s). Attempting re-login.",
+            resp.status_code,
+        )
         if api_login():
             resp = session.request(method, url, timeout=10, **kwargs)
         else:

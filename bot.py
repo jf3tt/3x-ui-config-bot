@@ -436,8 +436,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 # packet-up reliably carries data through Cloudflare; auto/stream-up
                 # can establish TLS but stall on the upload path ("connected, no net").
                 params["mode"] = "packet-up"
-            query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-            link = f"vless://{client_id}@{address}:{link_port}?{query}#{urllib.parse.quote(fragment)}"
+            query_string = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+            link = f"vless://{client_id}@{address}:{link_port}?{query_string}#{urllib.parse.quote(fragment)}"
         else:
             # Reality transport (raw TCP or XHTTP) — connects straight to the origin.
             encoded_spx = urllib.parse.quote(spx) if spx else ""

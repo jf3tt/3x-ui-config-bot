@@ -37,6 +37,11 @@ API_PASSWORD = os.getenv("API_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")  # Optional: channel for registration notifications
 
+# Per-inbound client email suffix. 3x-ui requires client emails to be globally
+# unique across all inbounds, so each inbound a user can provision on needs its
+# own suffix.
+INBOUND_EMAIL_SUFFIX = {1: "", 2: "-xhttp", 4: "-cf"}
+
 if not all([API_HOST, API_USERNAME, API_PASSWORD, TELEGRAM_TOKEN]):
     logger.error("Missing one or more required environment variables: "
                  "API_HOST, API_USERNAME, API_PASSWORD, TELEGRAM_TOKEN")
@@ -285,13 +290,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [
                 InlineKeyboardButton("Reality (TCP) 🌐", callback_data="config_1"),
                 InlineKeyboardButton("Reality (XHTTP) ⚡", callback_data="config_2"),
-            ]
+            ],
+            [
+                InlineKeyboardButton("CDN (Cloudflare) ☁️", callback_data="config_4"),
+            ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
             text="Choose a protocol:\n\n"
                  "• *Reality \\(TCP\\)* — standard, proven protocol\n"
-                 "• *Reality \\(XHTTP\\)* — newer protocol, better anti\\-censorship",
+                 "• *Reality \\(XHTTP\\)* — newer protocol, better anti\\-censorship\n"
+                 "• *CDN \\(Cloudflare\\)* — routed through Cloudflare, best when your "
+                 "provider blocks the server IP \\(e\\.g\\. Russia\\)",
             reply_markup=reply_markup,
             parse_mode="MarkdownV2"
         )
@@ -367,7 +377,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         user = update.effective_user
         base_email = user.username if user.username else f"user{user.id}"
-        client_email = f"{base_email}-xhttp" if int(inbound_id) == 2 else base_email
+        suffix = INBOUND_EMAIL_SUFFIX.get(int(inbound_id), f"-in{inbound_id}")
+        client_email = f"{base_email}{suffix}"
         logger.debug("User email to check: %s (base: %s)", client_email, base_email)
 
         # 1. Check if client already exists in the TARGET inbound
@@ -395,18 +406,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context.user_data["client_email"] = client_email
 
         fragment = f"{remark}-{client_email}"
-        server_host = urllib.parse.urlparse(API_HOST).hostname
-        encoded_spx = urllib.parse.quote(spx) if spx else ""
-        link = (
-            f"vless://{client_id}@{server_host}:{port}"
-            f"?type={network}&security={security}"
-            f"&pbk={pbk}&fp={fp}&sni={sni}&sid={sid}"
-            f"&spx={encoded_spx}"
-        )
-        if network == "xhttp" and xhttp_path:
-            encoded_path = urllib.parse.quote(xhttp_path)
-            link += f"&path={encoded_path}"
-        link += f"#{fragment}"
+        panel_host = urllib.parse.urlparse(API_HOST).hostname
+
+        if security == "tls":
+            # TLS transport, e.g. VLESS + XHTTP behind a CDN (Cloudflare). The
+            # client must reach the CDN hostname, not the origin IP, so prefer
+            # the externalProxy destination configured on the inbound.
+            tls_settings = stream_settings.get("tlsSettings", {})
+            tls_sub = tls_settings.get("settings", {})
+            external_proxy = stream_settings.get("externalProxy") or []
+            if external_proxy:
+                address = external_proxy[0].get("dest") or panel_host
+                link_port = external_proxy[0].get("port", port)
+            else:
+                address, link_port = panel_host, port
+            params = {
+                "type": network,
+                "encryption": "none",
+                "security": "tls",
+                "sni": tls_settings.get("serverName", ""),
+                "fp": tls_sub.get("fingerprint", "chrome"),
+            }
+            alpn = ",".join(tls_settings.get("alpn", []))
+            if alpn:
+                params["alpn"] = alpn
+            if network == "xhttp":
+                params["path"] = xhttp_settings.get("path", "")
+                params["host"] = xhttp_settings.get("host", "")
+                # packet-up reliably carries data through Cloudflare; auto/stream-up
+                # can establish TLS but stall on the upload path ("connected, no net").
+                params["mode"] = "packet-up"
+            query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+            link = f"vless://{client_id}@{address}:{link_port}?{query}#{urllib.parse.quote(fragment)}"
+        else:
+            # Reality transport (raw TCP or XHTTP) — connects straight to the origin.
+            encoded_spx = urllib.parse.quote(spx) if spx else ""
+            link = (
+                f"vless://{client_id}@{panel_host}:{port}"
+                f"?type={network}&encryption=none&security={security}"
+                f"&pbk={pbk}&fp={fp}&sni={sni}&sid={sid}"
+                f"&spx={encoded_spx}"
+            )
+            if network == "xhttp" and xhttp_path:
+                encoded_path = urllib.parse.quote(xhttp_path)
+                link += f"&path={encoded_path}"
+            link += f"#{fragment}"
         logger.debug("Generated link: %s", link)
 
         context.user_data["last_config"] = link
@@ -426,10 +470,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.debug("Retrieving stats for user id: %s", user_id)
         base_email = user.username if user.username else f"user{user.id}"
 
-        # Collect stats for both protocols (TCP = base_email, XHTTP = base_email-xhttp)
+        # Collect stats across every inbound the user may have provisioned.
         emails_to_check = [
             ("Reality (TCP)", base_email),
             ("Reality (XHTTP)", f"{base_email}-xhttp"),
+            ("CDN (Cloudflare)", f"{base_email}-cf"),
         ]
         stats_lines = []
         has_any_stats = False
@@ -462,11 +507,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "faq":
         faq_message = (
             "❓ *FAQ: How to Load Your Config*\n\n"
-            "*Two protocols available:*\n"
+            "*Three protocols available:*\n"
             "• *Reality (TCP)* — standard, proven protocol. Works everywhere.\n"
             "• *Reality (XHTTP)* — newer protocol with better anti-censorship properties. "
             "Try this if TCP is blocked in your region.\n"
-            "You can have configs on *both* protocols at the same time.\n\n"
+            "• *CDN (Cloudflare)* — routed through Cloudflare so the server IP is hidden. "
+            "Use this if both Reality options fail (e.g. the server IP is blocked in Russia).\n"
+            "You can have configs on *all* protocols at the same time.\n\n"
             "1. *Copy the Config*: Tap the config message to copy the VLESS link shown in the code block.\n"
             "2. *Open Your Client*: Launch your VLESS-compatible client (e.g., v2rayNG 1.9+, Hiddify, Streisand).\n"
             "3. *Import Config*: Look for an option like 'Import Config' or 'Scan QR Code'.\n"
